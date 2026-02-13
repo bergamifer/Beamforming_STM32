@@ -57,8 +57,17 @@
 /* External variables --------------------------------------------------------*/
 extern I2C_HandleTypeDef hi2c1;
 extern DMA_HandleTypeDef hdma_sai1_a;
+extern DMA_HandleTypeDef hdma_sai1_b;
+extern DMA_HandleTypeDef hdma_sai2_a;
+extern DMA_HandleTypeDef hdma_sai2_b;
+extern DMA_HandleTypeDef hdma_sai3_b;
 extern SAI_HandleTypeDef hsai_BlockA1;
+extern SAI_HandleTypeDef hsai_BlockB1;
+extern SAI_HandleTypeDef hsai_BlockA2;
+extern SAI_HandleTypeDef hsai_BlockB2;
+extern SAI_HandleTypeDef hsai_BlockB3;
 extern UART_HandleTypeDef huart7;
+extern UART_HandleTypeDef huart4;
 /* USER CODE BEGIN EV */
 
 /* USER CODE END EV */
@@ -258,17 +267,69 @@ void UART7_IRQHandler(void)
 }
 
 /**
+  * @brief This function handles UART4 global interrupt (ESP32 communication).
+  */
+void UART4_IRQHandler(void)
+{
+  HAL_UART_IRQHandler(&huart4);
+}
+
+/**
+  * @brief This function handles DMA1 stream1 global interrupt (SAI2_A).
+  */
+void DMA1_Stream1_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(&hdma_sai2_a);
+}
+
+/**
+  * @brief This function handles DMA1 stream2 global interrupt (SAI2_B).
+  */
+void DMA1_Stream2_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(&hdma_sai2_b);
+}
+
+/**
   * @brief This function handles SAI1 global interrupt.
   */
 void SAI1_IRQHandler(void)
 {
-  /* USER CODE BEGIN SAI1_IRQn 0 */
-
-  /* USER CODE END SAI1_IRQn 0 */
   HAL_SAI_IRQHandler(&hsai_BlockA1);
-  /* USER CODE BEGIN SAI1_IRQn 1 */
+  HAL_SAI_IRQHandler(&hsai_BlockB1);
+}
 
-  /* USER CODE END SAI1_IRQn 1 */
+/**
+  * @brief This function handles SAI2 global interrupt.
+  */
+void SAI2_IRQHandler(void)
+{
+  HAL_SAI_IRQHandler(&hsai_BlockA2);
+  HAL_SAI_IRQHandler(&hsai_BlockB2);
+}
+
+/**
+  * @brief This function handles DMA1 stream3 global interrupt (SAI1_B).
+  */
+void DMA1_Stream3_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(&hdma_sai1_b);
+}
+
+/**
+  * @brief This function handles DMA1 stream4 global interrupt (SAI3_B RX).
+  */
+void DMA1_Stream4_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(&hdma_sai3_b);
+}
+
+/**
+  * @brief This function handles SAI3 global interrupt (SAI3_B RX).
+  */
+void SAI3_IRQHandler(void)
+{
+  HAL_SAI_IRQHandler(&hsai_BlockB3);
 }
 
 /**

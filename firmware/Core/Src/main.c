@@ -21,9 +21,10 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <math.h>
 #include <string.h>
 #include <stdio.h>
+#include "epaper.h"
+#include "uart_protocol.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -35,13 +36,20 @@
 /* USER CODE BEGIN PD */
 #define AUDIO_SAMPLE_RATE    48000
 #define AUDIO_BUFFER_SAMPLES 480      // 10ms @ 48kHz
-#define AUDIO_CHANNELS       2        // Stereo
+#define AUDIO_CHANNELS       8        // TDM8 (8 channels per PCM1690)
 #define AUDIO_BUFFER_SIZE    (AUDIO_BUFFER_SAMPLES * AUDIO_CHANNELS)
 
-#define TEST_TONE_FREQ       1000.0f  // 1kHz test tone
-#ifndef M_PI
-#define M_PI                 3.14159265358979323846f
-#endif
+#define CPU_FREQ_MHZ         480      // CPU clock after PLL1 config
+
+#define ADC_CHANNELS         2        // PCM1802 stereo input
+#define ADC_BUFFER_SAMPLES   AUDIO_BUFFER_SAMPLES  // 480 samples = 10ms
+#define ADC_BUFFER_SIZE      (ADC_BUFFER_SAMPLES * ADC_CHANNELS)   // 960 samples
+
+// Beamforming delay line
+#define DELAY_LINE_SIZE      1024     // power of 2 for fast & mask
+#define DELAY_LINE_MASK      (DELAY_LINE_SIZE - 1)
+#define MAX_DELAY_SAMPLES    64       // ~1.33ms @ 48kHz = ~45.7cm at 343 m/s
+#define BEAM_NUM_CHANNELS    32
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -49,23 +57,76 @@
 
 /* USER CODE END PM */
 
+/* Beamforming config — 32 channels (expandable from ESP32's 16-ch ds_config_t) */
+typedef struct {
+    uint8_t  master_gain;                   // 0-255 → 0.0-1.0
+    uint8_t  mute_global;                   // 0=unmuted, 1=muted
+    uint16_t delays[BEAM_NUM_CHANNELS];     // delay in samples per channel
+    uint8_t  gains[BEAM_NUM_CHANNELS];      // gain per channel 0-255
+    uint32_t mutes;                         // bitfield: bit N = channel N muted
+} beam_config_t;
+
 /* Private variables ---------------------------------------------------------*/
 
 I2C_HandleTypeDef hi2c1;
 
 SAI_HandleTypeDef hsai_BlockA1;
+SAI_HandleTypeDef hsai_BlockB1;
+SAI_HandleTypeDef hsai_BlockA2;
+SAI_HandleTypeDef hsai_BlockB2;
+SAI_HandleTypeDef hsai_BlockB3;
 DMA_HandleTypeDef hdma_sai1_a;
+DMA_HandleTypeDef hdma_sai1_b;
+DMA_HandleTypeDef hdma_sai2_a;
+DMA_HandleTypeDef hdma_sai2_b;
+DMA_HandleTypeDef hdma_sai3_b;
+
+SPI_HandleTypeDef hspi2;
 
 UART_HandleTypeDef huart7;
+UART_HandleTypeDef huart4;
 
 /* USER CODE BEGIN PV */
-// Audio buffer (double buffer for DMA circular mode)
-// Format: [L0][R0][L1][R1]...[Ln][Rn]
-// MUST be in RAM_D2 for DMA1 access (DTCMRAM is NOT DMA-accessible on STM32H7!)
-static int32_t audio_buffer[AUDIO_BUFFER_SIZE * 2] __attribute__((section(".dma_buffer"), aligned(4)));
 
-// Phase accumulator for continuous sine wave
-static float sine_phase = 0.0f;
+/* ===== DMA Double Buffer (ping-pong) =====
+ * Layout: [HALF_A (480 × 8ch)][HALF_B (480 × 8ch)]
+ *          ^                    ^
+ *          HalfCplt fills A     FullCplt fills B
+ *
+ * TDM8: 8 channels interleaved per sample frame
+ * While DMA sends HALF_B → CPU fills HALF_A (and vice versa)
+ * MUST be in RAM_D2 for DMA1 access (DTCMRAM NOT DMA-accessible on STM32H7!)
+ */
+static int32_t audio_buffer[AUDIO_BUFFER_SIZE * 2] __attribute__((section(".dma_buffer"), aligned(32)));
+static int32_t audio_buffer_1b[AUDIO_BUFFER_SIZE * 2] __attribute__((section(".dma_buffer"), aligned(32)));
+static int32_t audio_buffer_2a[AUDIO_BUFFER_SIZE * 2] __attribute__((section(".dma_buffer"), aligned(32)));
+static int32_t audio_buffer_2b[AUDIO_BUFFER_SIZE * 2] __attribute__((section(".dma_buffer"), aligned(32)));
+static int32_t audio_buffer_3b_rx[ADC_BUFFER_SIZE * 2] __attribute__((section(".dma_buffer"), aligned(32)));
+
+// Circular delay lines for beamforming (one per beam/ADC channel)
+static int32_t delay_line_L[DELAY_LINE_SIZE] __attribute__((section(".dma_buffer"), aligned(32)));
+static int32_t delay_line_R[DELAY_LINE_SIZE] __attribute__((section(".dma_buffer"), aligned(32)));
+static uint32_t delay_write_pos = 0;  // Current write index into delay lines
+
+// Active beamforming config (copied from ESP32 ds_config_t on update)
+static beam_config_t beam_config;
+
+// ===== ISR → Main loop deferred processing flags =====
+// ISR sets flag, main loop processes buffer and clears flag
+// This keeps ISR execution < 20 cycles (vs ~50000 with sinf())
+static volatile uint8_t need_fill_first_half = 0;
+static volatile uint8_t need_fill_second_half = 0;
+static volatile uint8_t need_fill_2a_first_half = 0;
+static volatile uint8_t need_fill_2a_second_half = 0;
+static volatile uint8_t need_fill_1b_first_half = 0;
+static volatile uint8_t need_fill_1b_second_half = 0;
+static volatile uint8_t need_fill_2b_first_half = 0;
+static volatile uint8_t need_fill_2b_second_half = 0;
+static volatile uint8_t rx_3b_first_half_ready = 0;
+static volatile uint8_t rx_3b_second_half_ready = 0;
+
+// Underrun detection: flag set but not serviced before next ISR
+static volatile uint32_t underrun_count = 0;
 
 // Callback counters for debug
 static volatile uint32_t half_complete_count = 0;
@@ -73,8 +134,34 @@ static volatile uint32_t full_complete_count = 0;
 static volatile uint32_t error_count = 0;
 static volatile uint32_t last_sai_error = 0;
 
+// ===== Latency & Jitter measurement via DWT cycle counter =====
+// DWT->CYCCNT runs at CPU clock (480MHz → 2.08ns/cycle)
+static volatile uint32_t last_half_isr_cycles = 0;
+static volatile uint32_t last_full_isr_cycles = 0;
+
+// Jitter tracking: callback period variation (Half + Full combined)
+static volatile uint32_t jitter_min_cycles = 0xFFFFFFFF;
+static volatile uint32_t jitter_max_cycles = 0;
+static volatile uint64_t jitter_sum_cycles = 0;
+static volatile uint32_t jitter_sample_count = 0;
+
+// Processing latency: fill buffer + cache clean
+static volatile uint32_t fill_min_cycles = 0xFFFFFFFF;
+static volatile uint32_t fill_max_cycles = 0;
+static volatile uint64_t fill_sum_cycles = 0;
+static volatile uint32_t fill_sample_count = 0;
+
 // UART TX buffer
 static char uart_buf[128];
+
+// E-Paper display buffer (5000 bytes for 200x200)
+static uint8_t epd_buffer[EPD_BUFFER_SIZE] __attribute__((section(".dma_buffer"), aligned(32)));
+
+// Test cycle counter (for e-paper update every 60s)
+static uint32_t test_cycle = 0;
+
+// E-Paper availability flag (0 = not connected/failed, 1 = ready)
+static uint8_t epd_available = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -85,10 +172,18 @@ static void MX_DMA_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_UART7_Init(void);
 static void MX_SAI1_Init(void);
+static void MX_SPI2_Init(void);
+static void MX_UART4_Init(void);
+static void MX_SAI2_Init(void);
+static void MX_SAI3_Init(void);
 /* USER CODE BEGIN PFP */
-static void Fill_Audio_Buffer(int32_t *buffer, uint32_t samples);
+static void Fill_Audio_Beamform(int32_t *buffer, uint32_t samples, uint32_t ch_offset);
+static void Process_ADC_Half(int32_t *rx_buf, uint32_t samples);
 static void UART_Print(const char *str);
 static void Print_DMA_Config(void);
+static void EPD_GPIO_Init(void);
+static void EPD_ShowTestResults(uint32_t half_cnt, uint32_t full_cnt, uint32_t err_cnt,
+                                uint32_t time_s, uint8_t passed, uint32_t underruns);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -132,66 +227,169 @@ int main(void)
   MX_I2C1_Init();
   MX_UART7_Init();
   MX_SAI1_Init();
+  MX_SPI2_Init();
+  MX_UART4_Init();
+  MX_SAI2_Init();
+  MX_SAI3_Init();
   /* USER CODE BEGIN 2 */
 
-  // Initialize PE3 as output for WeAct onboard LED (active LOW)
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  GPIO_InitStruct.Pin = GPIO_PIN_3;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+  // PE3 is now SAI1_SD_B — no LED on WeAct in DS10 config
+  // On DS10 board, use PC4/PC5/PB0/PB1 LEDs instead
 
   // Startup message
-  UART_Print("\r\n=== WeAct I2S Audio Test ===\r\n");
-  UART_Print("SAI1 Config: 48kHz, 24-bit, Stereo\r\n");
-  UART_Print("Test tone: 1kHz sine wave\r\n\r\n");
+  UART_Print("\r\n=== WeAct Beamforming Audio (DS10 config) ===\r\n");
+  UART_Print("CPU: 480MHz (VOS0), HCLK: 240MHz, APB: 120MHz\r\n");
+  UART_Print("SAI1_A+B: TDM8 ch0-15, SAI2_A+B: TDM8 ch16-31, SAI3_B: RX 2ch\r\n");
+  UART_Print("Mode: Beamforming (ADC L -> delay lines -> 32ch DAC)\r\n\r\n");
 
-  // LED ON to indicate startup (PE3 active LOW on WeAct board)
-  HAL_GPIO_WritePin(GPIOE, GPIO_PIN_3, GPIO_PIN_RESET);  // LED ON (active low)
+  // === Beamforming init ===
+  // Zero delay lines
+  memset(delay_line_L, 0, sizeof(delay_line_L));
+  memset(delay_line_R, 0, sizeof(delay_line_R));
+  delay_write_pos = 0;
 
-  // Pre-fill the entire buffer with audio data
-  Fill_Audio_Buffer(&audio_buffer[0], AUDIO_BUFFER_SAMPLES);
-  Fill_Audio_Buffer(&audio_buffer[AUDIO_BUFFER_SIZE], AUDIO_BUFFER_SAMPLES);
+  // Default beam config: all gains max, no delays, unmuted
+  beam_config.master_gain = 255;
+  beam_config.mute_global = 0;
+  memset(beam_config.delays, 0, sizeof(beam_config.delays));
+  memset(beam_config.gains, 255, sizeof(beam_config.gains));  // 0xFF = unity gain
+  beam_config.mutes = 0;
+  UART_Print("Beamforming initialized (delay lines zeroed, gains=max)\r\n");
 
-  // Debug: Print SAI configuration
-  sprintf(uart_buf, "SAI1 AudioFreq: %lu Hz\r\n", hsai_BlockA1.Init.AudioFrequency);
-  UART_Print(uart_buf);
-  sprintf(uart_buf, "Buffer size: %d samples (%d bytes)\r\n", AUDIO_BUFFER_SIZE * 2, (int)sizeof(audio_buffer));
-  UART_Print(uart_buf);
+  // Pre-fill TX buffers with silence (zeros)
+  memset(audio_buffer, 0, sizeof(audio_buffer));
+  SCB_CleanDCache_by_Addr((uint32_t*)audio_buffer, sizeof(audio_buffer));
+  memset(audio_buffer_1b, 0, sizeof(audio_buffer_1b));
+  SCB_CleanDCache_by_Addr((uint32_t*)audio_buffer_1b, sizeof(audio_buffer_1b));
+  UART_Print("TX buffers pre-filled (silence)\r\n");
 
-  // Start SAI DMA transmission (circular mode)
-  HAL_StatusTypeDef status = HAL_SAI_Transmit_DMA(&hsai_BlockA1, (uint8_t*)audio_buffer, AUDIO_BUFFER_SIZE * 2);
-
+  // Start SAI1_B (slave) BEFORE SAI1_A (master) - slave must be ready when master clocks
+  HAL_StatusTypeDef status;
+  status = HAL_SAI_Transmit_DMA(&hsai_BlockB1, (uint8_t*)audio_buffer_1b, AUDIO_BUFFER_SIZE * 2);
   if (status == HAL_OK) {
-    UART_Print("DMA Started OK!\r\n");
-    // Verify SAI and DMA states
-    sprintf(uart_buf, "SAI State after start: %d (2=BUSY_TX)\r\n", HAL_SAI_GetState(&hsai_BlockA1));
-    UART_Print(uart_buf);
-    sprintf(uart_buf, "DMA State: %d (2=READY, 3=BUSY)\r\n", hdma_sai1_a.State);
-    UART_Print(uart_buf);
-
-    // Print detailed DMA configuration for verification
-    Print_DMA_Config();
+    UART_Print("SAI1_B DMA Started OK (slave, waiting for master)\r\n");
   } else {
-    sprintf(uart_buf, "DMA Start FAILED! Status: %d\r\n", status);
-    UART_Print(uart_buf);
-    sprintf(uart_buf, "SAI Error Code: 0x%08lX\r\n", HAL_SAI_GetError(&hsai_BlockA1));
+    sprintf(uart_buf, "SAI1_B DMA FAILED! Status: %d, Error: 0x%08lX\r\n",
+            status, HAL_SAI_GetError(&hsai_BlockB1));
     UART_Print(uart_buf);
   }
 
-  // Small delay then check state again
-  HAL_Delay(100);
-  sprintf(uart_buf, "After 100ms - SAI State: %d, Errors: %lu\r\n",
-          HAL_SAI_GetState(&hsai_BlockA1), error_count);
+  status = HAL_SAI_Transmit_DMA(&hsai_BlockA1, (uint8_t*)audio_buffer, AUDIO_BUFFER_SIZE * 2);
+  if (status == HAL_OK) {
+    UART_Print("SAI1_A DMA Started OK (master)\r\n");
+    Print_DMA_Config();
+  } else {
+    sprintf(uart_buf, "SAI1_A DMA FAILED! Status: %d, Error: 0x%08lX\r\n",
+            status, HAL_SAI_GetError(&hsai_BlockA1));
+    UART_Print(uart_buf);
+  }
+
+  // === SAI2 (DAC2 + DAC3) DMA start ===
+  // Pre-fill SAI2 buffers with silence
+  memset(audio_buffer_2a, 0, sizeof(audio_buffer_2a));
+  SCB_CleanDCache_by_Addr((uint32_t*)audio_buffer_2a, sizeof(audio_buffer_2a));
+  memset(audio_buffer_2b, 0, sizeof(audio_buffer_2b));
+  SCB_CleanDCache_by_Addr((uint32_t*)audio_buffer_2b, sizeof(audio_buffer_2b));
+
+  // Start SAI2_B (slave) BEFORE SAI2_A (master) - slave must be ready when master clocks
+  status = HAL_SAI_Transmit_DMA(&hsai_BlockB2, (uint8_t*)audio_buffer_2b, AUDIO_BUFFER_SIZE * 2);
+  if (status == HAL_OK) {
+    UART_Print("SAI2_B DMA Started OK (slave, waiting for master)\r\n");
+  } else {
+    sprintf(uart_buf, "SAI2_B DMA FAILED! Status: %d, Error: 0x%08lX\r\n",
+            status, HAL_SAI_GetError(&hsai_BlockB2));
+    UART_Print(uart_buf);
+  }
+
+  status = HAL_SAI_Transmit_DMA(&hsai_BlockA2, (uint8_t*)audio_buffer_2a, AUDIO_BUFFER_SIZE * 2);
+  if (status == HAL_OK) {
+    UART_Print("SAI2_A DMA Started OK (master)\r\n");
+  } else {
+    sprintf(uart_buf, "SAI2_A DMA FAILED! Status: %d, Error: 0x%08lX\r\n",
+            status, HAL_SAI_GetError(&hsai_BlockA2));
+    UART_Print(uart_buf);
+  }
+
+  // === SAI3_B RX DMA start (ADC input) ===
+  SCB_InvalidateDCache_by_Addr((uint32_t*)audio_buffer_3b_rx, sizeof(audio_buffer_3b_rx));
+  status = HAL_SAI_Receive_DMA(&hsai_BlockB3, (uint8_t*)audio_buffer_3b_rx, ADC_BUFFER_SIZE * 2);
+  if (status == HAL_OK) {
+    UART_Print("SAI3_B RX DMA Started OK (ADC master)\r\n");
+  } else {
+    sprintf(uart_buf, "SAI3_B RX DMA FAILED! Status: %d, Error: 0x%08lX\r\n",
+            status, HAL_SAI_GetError(&hsai_BlockB3));
+    UART_Print(uart_buf);
+  }
+
+  // === E-Paper init (NON-FATAL - audio already running) ===
+  EPD_GPIO_Init();
+  sprintf(uart_buf, "BUSY pin: %d (0=ready/not connected, 1=busy)\r\n",
+          HAL_GPIO_ReadPin(EPD_BUSY_PORT, EPD_BUSY_PIN));
   UART_Print(uart_buf);
+
+  UART_Print("Initializing E-Paper display...\r\n");
+  EPD_Status epd_status = EPD_Init(&hspi2);
+  if (epd_status == EPD_OK) {
+    epd_available = 1;
+    UART_Print("E-Paper init OK!\r\n");
+    EPD_FillBuffer(epd_buffer, EPD_WHITE);
+    EPD_DrawString(epd_buffer, 20, 30, "DMA AUDIO TEST", 16, EPD_BLACK);
+    EPD_DrawString(epd_buffer, 30, 60, "TDM8 48KHZ", 16, EPD_BLACK);
+    EPD_DrawRect(epd_buffer, 5, 5, 190, 190, EPD_BLACK);
+    EPD_Display(epd_buffer);
+    UART_Print("E-Paper startup screen displayed\r\n");
+  } else {
+    epd_available = 0;
+    sprintf(uart_buf, "E-Paper skipped (status: %d) - audio running without it\r\n", epd_status);
+    UART_Print(uart_buf);
+  }
+
+  // === ESP32 UART protocol init ===
+  UART_Protocol_Init(&huart4, &huart7);
+
+  // Reset counters + flags after e-paper init (underruns during init are expected)
+  need_fill_first_half = 0;
+  need_fill_second_half = 0;
+  need_fill_1b_first_half = 0;
+  need_fill_1b_second_half = 0;
+  need_fill_2a_first_half = 0;
+  need_fill_2a_second_half = 0;
+  need_fill_2b_first_half = 0;
+  need_fill_2b_second_half = 0;
+  rx_3b_first_half_ready = 0;
+  rx_3b_second_half_ready = 0;
+  half_complete_count = 0;
+  full_complete_count = 0;
+  underrun_count = 0;
+  error_count = 0;
+  __DSB();
+
+  // Enable DWT cycle counter for latency measurement (ARM Cortex-M7)
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+  // Reset jitter tracking AFTER DWT enable (callbacks during e-paper init
+  // may have stored stale CYCCNT values if debugger had DWT already running)
+  __disable_irq();
+  last_half_isr_cycles = 0;
+  last_full_isr_cycles = 0;
+  jitter_min_cycles = 0xFFFFFFFF;
+  jitter_max_cycles = 0;
+  jitter_sum_cycles = 0;
+  jitter_sample_count = 0;
+  fill_min_cycles = 0xFFFFFFFF;
+  fill_max_cycles = 0;
+  fill_sum_cycles = 0;
+  fill_sample_count = 0;
+  __enable_irq();
+  UART_Print("DWT cycle counter enabled (latency measurement)\r\n");
 
   // Variables for main loop
   uint32_t last_tick = HAL_GetTick();
   uint32_t last_half = 0;
   uint32_t last_full = 0;
   uint32_t test_start = HAL_GetTick();
-  uint8_t test_complete = 0;
 
   /* USER CODE END 2 */
 
@@ -202,6 +400,117 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+
+    // ===== Deferred buffer fill: beamform from delay line =====
+    // ISR sets flag, we process here in main context
+    // SAI1_A: channels 0-7
+    if (need_fill_first_half) {
+      need_fill_first_half = 0;
+      __DSB();
+      uint32_t t0 = DWT->CYCCNT;
+      Fill_Audio_Beamform(&audio_buffer[0], AUDIO_BUFFER_SAMPLES, 0);
+      SCB_CleanDCache_by_Addr((uint32_t*)&audio_buffer[0],
+                              AUDIO_BUFFER_SIZE * sizeof(int32_t));
+      uint32_t dt = DWT->CYCCNT - t0;
+      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);  // PB5 LOW (fill done)
+      if (dt < fill_min_cycles) fill_min_cycles = dt;
+      if (dt > fill_max_cycles) fill_max_cycles = dt;
+      fill_sum_cycles += dt;
+      fill_sample_count++;
+    }
+    if (need_fill_second_half) {
+      need_fill_second_half = 0;
+      __DSB();
+      uint32_t t0 = DWT->CYCCNT;
+      Fill_Audio_Beamform(&audio_buffer[AUDIO_BUFFER_SIZE], AUDIO_BUFFER_SAMPLES, 0);
+      SCB_CleanDCache_by_Addr((uint32_t*)&audio_buffer[AUDIO_BUFFER_SIZE],
+                              AUDIO_BUFFER_SIZE * sizeof(int32_t));
+      uint32_t dt = DWT->CYCCNT - t0;
+      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);  // PB5 LOW (fill done)
+      if (dt < fill_min_cycles) fill_min_cycles = dt;
+      if (dt > fill_max_cycles) fill_max_cycles = dt;
+      fill_sum_cycles += dt;
+      fill_sample_count++;
+    }
+
+    // SAI1_B: channels 8-15
+    if (need_fill_1b_first_half) {
+      need_fill_1b_first_half = 0;
+      __DSB();
+      Fill_Audio_Beamform(&audio_buffer_1b[0], AUDIO_BUFFER_SAMPLES, 8);
+      SCB_CleanDCache_by_Addr((uint32_t*)&audio_buffer_1b[0],
+                              AUDIO_BUFFER_SIZE * sizeof(int32_t));
+    }
+    if (need_fill_1b_second_half) {
+      need_fill_1b_second_half = 0;
+      __DSB();
+      Fill_Audio_Beamform(&audio_buffer_1b[AUDIO_BUFFER_SIZE], AUDIO_BUFFER_SAMPLES, 8);
+      SCB_CleanDCache_by_Addr((uint32_t*)&audio_buffer_1b[AUDIO_BUFFER_SIZE],
+                              AUDIO_BUFFER_SIZE * sizeof(int32_t));
+    }
+
+    // SAI2_A: channels 16-23
+    if (need_fill_2a_first_half) {
+      need_fill_2a_first_half = 0;
+      __DSB();
+      Fill_Audio_Beamform(&audio_buffer_2a[0], AUDIO_BUFFER_SAMPLES, 16);
+      SCB_CleanDCache_by_Addr((uint32_t*)&audio_buffer_2a[0],
+                              AUDIO_BUFFER_SIZE * sizeof(int32_t));
+    }
+    if (need_fill_2a_second_half) {
+      need_fill_2a_second_half = 0;
+      __DSB();
+      Fill_Audio_Beamform(&audio_buffer_2a[AUDIO_BUFFER_SIZE], AUDIO_BUFFER_SAMPLES, 16);
+      SCB_CleanDCache_by_Addr((uint32_t*)&audio_buffer_2a[AUDIO_BUFFER_SIZE],
+                              AUDIO_BUFFER_SIZE * sizeof(int32_t));
+    }
+
+    // SAI2_B: channels 24-31
+    if (need_fill_2b_first_half) {
+      need_fill_2b_first_half = 0;
+      __DSB();
+      Fill_Audio_Beamform(&audio_buffer_2b[0], AUDIO_BUFFER_SAMPLES, 24);
+      SCB_CleanDCache_by_Addr((uint32_t*)&audio_buffer_2b[0],
+                              AUDIO_BUFFER_SIZE * sizeof(int32_t));
+    }
+    if (need_fill_2b_second_half) {
+      need_fill_2b_second_half = 0;
+      __DSB();
+      Fill_Audio_Beamform(&audio_buffer_2b[AUDIO_BUFFER_SIZE], AUDIO_BUFFER_SAMPLES, 24);
+      SCB_CleanDCache_by_Addr((uint32_t*)&audio_buffer_2b[AUDIO_BUFFER_SIZE],
+                              AUDIO_BUFFER_SIZE * sizeof(int32_t));
+    }
+
+    // ===== SAI3_B RX → feed delay lines (MUST run before TX fills) =====
+    if (rx_3b_first_half_ready) {
+      rx_3b_first_half_ready = 0;
+      __DSB();
+      SCB_InvalidateDCache_by_Addr((uint32_t*)&audio_buffer_3b_rx[0],
+                                    ADC_BUFFER_SIZE * sizeof(int32_t));
+      Process_ADC_Half(&audio_buffer_3b_rx[0], ADC_BUFFER_SAMPLES);
+    }
+    if (rx_3b_second_half_ready) {
+      rx_3b_second_half_ready = 0;
+      __DSB();
+      SCB_InvalidateDCache_by_Addr((uint32_t*)&audio_buffer_3b_rx[ADC_BUFFER_SIZE],
+                                    ADC_BUFFER_SIZE * sizeof(int32_t));
+      Process_ADC_Half(&audio_buffer_3b_rx[ADC_BUFFER_SIZE], ADC_BUFFER_SAMPLES);
+    }
+
+    // ===== Check for new ESP32 config → apply to beam_config =====
+    if (UART_Protocol_HasNewConfig()) {
+      const ds_config_t *cfg = UART_Protocol_GetConfig();
+      beam_config.master_gain = cfg->master_gain;
+      beam_config.mute_global = cfg->mute_global;
+      // Map 16 ESP32 channels into first 16 beam channels
+      for (uint32_t i = 0; i < CFG_NUM_CHANNELS; i++) {
+        beam_config.delays[i] = cfg->delays[i];
+        beam_config.gains[i] = cfg->gains[i];
+      }
+      beam_config.mutes = (uint32_t)cfg->mutes;  // lower 16 bits
+      UART_Protocol_PrintConfig();
+      UART_Print("Config applied to beamformer\r\n");
+    }
 
     // Print status every second
     if (HAL_GetTick() - last_tick >= 1000) {
@@ -215,10 +524,29 @@ int main(void)
       last_half = half_complete_count;
       last_full = full_complete_count;
 
-      // Expected: 50 half + 50 full per second (20ms buffer cycle @ 48kHz stereo)
-      sprintf(uart_buf, "[%lus] Half: %lu/s, Full: %lu/s, Errors: %lu\r\n",
-              HAL_GetTick() / 1000, half_per_sec, full_per_sec, error_count);
+      // Expected: 50 half + 50 full per second (20ms buffer cycle @ 48kHz TDM8)
+      sprintf(uart_buf, "[%lus] Half: %lu/s, Full: %lu/s, Err: %lu, Undr: %lu\r\n",
+              HAL_GetTick() / 1000, half_per_sec, full_per_sec,
+              error_count, underrun_count);
       UART_Print(uart_buf);
+
+      // Latency stats (cycles → microseconds: cycles / CPU_FREQ_MHZ)
+      // CPU @ 480MHz: 1 cycle = 2.08ns, so us = cycles / 480
+      if (fill_sample_count > 0) {
+        uint32_t fill_avg = (uint32_t)(fill_sum_cycles / fill_sample_count);
+        sprintf(uart_buf, "     Fill: min=%lu avg=%lu max=%lu cyc (%lu/%lu/%lu us)\r\n",
+                fill_min_cycles, fill_avg, fill_max_cycles,
+                fill_min_cycles / CPU_FREQ_MHZ, fill_avg / CPU_FREQ_MHZ, fill_max_cycles / CPU_FREQ_MHZ);
+        UART_Print(uart_buf);
+      }
+      if (jitter_sample_count > 0) {
+        uint32_t jitter_avg = (uint32_t)(jitter_sum_cycles / jitter_sample_count);
+        uint32_t jitter_range = jitter_max_cycles - jitter_min_cycles;
+        sprintf(uart_buf, "     Jitter: period min=%lu avg=%lu max=%lu cyc (range=%lu = %lu us)\r\n",
+                jitter_min_cycles, jitter_avg, jitter_max_cycles,
+                jitter_range, jitter_range / CPU_FREQ_MHZ);
+        UART_Print(uart_buf);
+      }
 
       // Check SAI status
       HAL_SAI_StateTypeDef sai_state = HAL_SAI_GetState(&hsai_BlockA1);
@@ -230,31 +558,133 @@ int main(void)
         UART_Print(uart_buf);
       }
 
-      // 60-second test summary
-      if (!test_complete && (HAL_GetTick() - test_start >= 60000)) {
-        test_complete = 1;
+      // 60-second test summary (repeating)
+      if (HAL_GetTick() - test_start >= 60000) {
+        test_cycle++;
+        uint32_t total_time = test_cycle * 60;
+
+        // Snapshot counters BEFORE blocking UART prints
+        // (UART printing takes ~50ms total, can cause spurious underrun)
+        uint32_t snap_half = half_complete_count;
+        uint32_t snap_full = full_complete_count;
+        uint32_t snap_err = error_count;
+        uint32_t snap_undr = underrun_count;
+
+        // Snapshot latency stats
+        uint32_t snap_fill_min = fill_min_cycles;
+        uint32_t snap_fill_max = fill_max_cycles;
+        uint32_t snap_fill_avg = fill_sample_count > 0
+            ? (uint32_t)(fill_sum_cycles / fill_sample_count) : 0;
+        uint32_t snap_jitter_min = jitter_min_cycles;
+        uint32_t snap_jitter_max = jitter_max_cycles;
+        uint32_t snap_jitter_avg = jitter_sample_count > 0
+            ? (uint32_t)(jitter_sum_cycles / jitter_sample_count) : 0;
+
+        uint8_t test_passed = (snap_err == 0 && snap_undr == 0
+                               && snap_half >= 2900 && snap_full >= 2900);
+
         UART_Print("\r\n========== 60 SECOND TEST COMPLETE ==========\r\n");
-        sprintf(uart_buf, "Total Half callbacks: %lu (expected ~3000)\r\n", half_complete_count);
+        sprintf(uart_buf, "Cycle #%lu (Total time: %lu s)\r\n", test_cycle, total_time);
         UART_Print(uart_buf);
-        sprintf(uart_buf, "Total Full callbacks: %lu (expected ~3000)\r\n", full_complete_count);
+        sprintf(uart_buf, "Total Half callbacks: %lu (expected ~3000)\r\n", snap_half);
         UART_Print(uart_buf);
-        sprintf(uart_buf, "Total Errors: %lu\r\n", error_count);
+        sprintf(uart_buf, "Total Full callbacks: %lu (expected ~3000)\r\n", snap_full);
+        UART_Print(uart_buf);
+        sprintf(uart_buf, "Total Errors: %lu\r\n", snap_err);
+        UART_Print(uart_buf);
+        sprintf(uart_buf, "Avg Half rate: %lu/s (expected 50)\r\n", snap_half / 60);
+        UART_Print(uart_buf);
+        sprintf(uart_buf, "Avg Full rate: %lu/s (expected 50)\r\n", snap_full / 60);
+        UART_Print(uart_buf);
+        sprintf(uart_buf, "Total Underruns: %lu\r\n", snap_undr);
         UART_Print(uart_buf);
 
-        // Verify timing accuracy
-        float half_rate = (float)half_complete_count / 60.0f;
-        float full_rate = (float)full_complete_count / 60.0f;
-        sprintf(uart_buf, "Avg Half rate: %.1f/s (expected 50)\r\n", half_rate);
+        // Latency characterization report
+        uint32_t buf_latency_us = (AUDIO_BUFFER_SAMPLES * 1000) / (AUDIO_SAMPLE_RATE / 1000);
+        UART_Print("\r\n--- LATENCY CHARACTERIZATION ---\r\n");
+        sprintf(uart_buf, "Buffer: %d samples = %lu us\r\n",
+                AUDIO_BUFFER_SAMPLES, buf_latency_us);
         UART_Print(uart_buf);
-        sprintf(uart_buf, "Avg Full rate: %.1f/s (expected 50)\r\n", full_rate);
+        sprintf(uart_buf, "Fill min: %lu cyc = %lu us\r\n",
+                snap_fill_min, snap_fill_min / CPU_FREQ_MHZ);
+        UART_Print(uart_buf);
+        sprintf(uart_buf, "Fill avg: %lu cyc = %lu us\r\n",
+                snap_fill_avg, snap_fill_avg / CPU_FREQ_MHZ);
+        UART_Print(uart_buf);
+        sprintf(uart_buf, "Fill max: %lu cyc = %lu us\r\n",
+                snap_fill_max, snap_fill_max / CPU_FREQ_MHZ);
+        UART_Print(uart_buf);
+        sprintf(uart_buf, "Total pipeline: %lu us + %lu us = %lu us\r\n",
+                buf_latency_us, snap_fill_avg / CPU_FREQ_MHZ,
+                buf_latency_us + snap_fill_avg / CPU_FREQ_MHZ);
         UART_Print(uart_buf);
 
-        if (error_count == 0 && half_complete_count >= 2900 && full_complete_count >= 2900) {
-          UART_Print(">>> TEST PASSED: DMA working correctly! <<<\r\n");
+        UART_Print("\r\n--- JITTER ANALYSIS ---\r\n");
+        // Period between consecutive Half (or Full) callbacks = full buffer cycle = 2 × half-buffer
+        uint32_t expected_period = (uint32_t)((uint64_t)AUDIO_BUFFER_SAMPLES * 2 * CPU_FREQ_MHZ * 1000000ULL / AUDIO_SAMPLE_RATE);
+        sprintf(uart_buf, "Expected period: %lu cyc (%lu us)\r\n",
+                expected_period, expected_period / CPU_FREQ_MHZ);
+        UART_Print(uart_buf);
+        sprintf(uart_buf, "Measured min:    %lu cyc (%lu us)\r\n",
+                snap_jitter_min, snap_jitter_min / CPU_FREQ_MHZ);
+        UART_Print(uart_buf);
+        sprintf(uart_buf, "Measured avg:    %lu cyc (%lu us)\r\n",
+                snap_jitter_avg, snap_jitter_avg / CPU_FREQ_MHZ);
+        UART_Print(uart_buf);
+        sprintf(uart_buf, "Measured max:    %lu cyc (%lu us)\r\n",
+                snap_jitter_max, snap_jitter_max / CPU_FREQ_MHZ);
+        UART_Print(uart_buf);
+        uint32_t jitter_range = snap_jitter_max - snap_jitter_min;
+        sprintf(uart_buf, "Jitter range:    %lu cyc = %lu us\r\n",
+                jitter_range, jitter_range / CPU_FREQ_MHZ);
+        UART_Print(uart_buf);
+
+        if (test_passed) {
+          UART_Print("\r\n>>> TEST PASSED: DMA pipeline clean! <<<\r\n");
         } else {
-          UART_Print(">>> TEST FAILED: Check errors above <<<\r\n");
+          UART_Print("\r\n>>> TEST FAILED: Check errors above <<<\r\n");
         }
         UART_Print("==============================================\r\n\r\n");
+
+        // Update E-Paper display with results (only if available)
+        if (epd_available) {
+          EPD_ShowTestResults(snap_half, snap_full, snap_err,
+                              total_time, test_passed, snap_undr);
+        }
+
+        // Reset counters + flags + latency stats for next cycle
+        // Atomic reset: disable IRQ so ISR can't write between our resets
+        __disable_irq();
+        need_fill_first_half = 0;
+        need_fill_second_half = 0;
+        need_fill_1b_first_half = 0;
+        need_fill_1b_second_half = 0;
+        need_fill_2a_first_half = 0;
+        need_fill_2a_second_half = 0;
+        need_fill_2b_first_half = 0;
+        need_fill_2b_second_half = 0;
+        rx_3b_first_half_ready = 0;
+        rx_3b_second_half_ready = 0;
+        half_complete_count = 0;
+        full_complete_count = 0;
+        error_count = 0;
+        underrun_count = 0;
+        last_half = 0;
+        last_full = 0;
+        // Reset latency tracking
+        last_half_isr_cycles = 0;
+        last_full_isr_cycles = 0;
+        jitter_min_cycles = 0xFFFFFFFF;
+        jitter_max_cycles = 0;
+        jitter_sum_cycles = 0;
+        jitter_sample_count = 0;
+        fill_min_cycles = 0xFFFFFFFF;
+        fill_max_cycles = 0;
+        fill_sum_cycles = 0;
+        fill_sample_count = 0;
+        __DSB();
+        __enable_irq();
+        test_start = HAL_GetTick();
       }
     }
   }
@@ -274,46 +704,53 @@ void SystemClock_Config(void)
   */
   HAL_PWREx_ConfigSupply(PWR_LDO_SUPPLY);
 
-  /** Configure the main internal regulator output voltage
+  /** Configure voltage scaling: VOS0 (480MHz) requires stepping through VOS1 first
+   *  VOS1 → enable SYSCFG → VOS0 (overdrive)
   */
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
-
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
   while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
+  __HAL_RCC_SYSCFG_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE0);
+  while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
+
+  /** PLL1: HSE 25MHz / M=5 = 5MHz VCI → N=192 → 960MHz VCO → /P=2 = 480MHz SYSCLK
+   *  VCI range: 4-8MHz (RCC_PLL1VCIRANGE_2)
+   *  VCO range: wide 192-960MHz (RCC_PLL1VCOWIDE)
   */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = 2;
-  RCC_OscInitStruct.PLL.PLLN = 12;
+  RCC_OscInitStruct.PLL.PLLM = 5;
+  RCC_OscInitStruct.PLL.PLLN = 192;
   RCC_OscInitStruct.PLL.PLLP = 2;
-  RCC_OscInitStruct.PLL.PLLQ = 2;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
   RCC_OscInitStruct.PLL.PLLR = 2;
-  RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_3;
-  RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOMEDIUM;
+  RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_2;
+  RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOWIDE;
   RCC_OscInitStruct.PLL.PLLFRACN = 0;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
   }
 
-  /** Initializes the CPU, AHB and APB buses clocks
+  /** Bus clocks: SYSCLK=480MHz, HCLK=240MHz, APBx=120MHz
+   *  HCLK /2 = 240MHz (max for VOS0)
+   *  APB1-4 /2 = 120MHz each (I2C1, SPI2, UART7 derive from APB)
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2
                               |RCC_CLOCKTYPE_D3PCLK1|RCC_CLOCKTYPE_D1PCLK1;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV1;
-  RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV1;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV2;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV2;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV1;
-  RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV2;
+  RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV2;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
   {
     Error_Handler();
   }
@@ -329,7 +766,7 @@ void PeriphCommonClock_Config(void)
 
   /** Initializes the peripherals clock
   */
-  PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_SAI1|RCC_PERIPHCLK_UART7;
+  PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_SAI1|RCC_PERIPHCLK_SAI2|RCC_PERIPHCLK_UART7;
   PeriphClkInitStruct.PLL3.PLL3M = 5;
   PeriphClkInitStruct.PLL3.PLL3N = 68;
   PeriphClkInitStruct.PLL3.PLL3P = 28;
@@ -339,6 +776,7 @@ void PeriphCommonClock_Config(void)
   PeriphClkInitStruct.PLL3.PLL3VCOSEL = RCC_PLL3VCOWIDE;
   PeriphClkInitStruct.PLL3.PLL3FRACN = 6660;  // For exact 12.288 MHz MCLK (was 6329)
   PeriphClkInitStruct.Sai1ClockSelection = RCC_SAI1CLKSOURCE_PLL3;
+  PeriphClkInitStruct.Sai23ClockSelection = RCC_SAI23CLKSOURCE_PLL3;
   PeriphClkInitStruct.Usart234578ClockSelection = RCC_USART234578CLKSOURCE_PLL3;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
   {
@@ -362,7 +800,7 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.Timing = 0x00909FCE;
+  hi2c1.Init.Timing = 0x307075B1;  // 100kHz SM @ 120MHz APB1 (was 0x00909FCE @ 37.5MHz)
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
@@ -428,20 +866,51 @@ static void MX_SAI1_Init(void)
   hsai_BlockA1.Init.PdmInit.Activation = DISABLE;
   hsai_BlockA1.Init.PdmInit.MicPairsNbr = 1;
   hsai_BlockA1.Init.PdmInit.ClockEnable = SAI_PDM_CLOCK1_ENABLE;
-  hsai_BlockA1.FrameInit.FrameLength = 64;
+  hsai_BlockA1.FrameInit.FrameLength = 256;           // TDM8: 8 slots × 32 bits
   hsai_BlockA1.FrameInit.ActiveFrameLength = 32;
   hsai_BlockA1.FrameInit.FSDefinition = SAI_FS_CHANNEL_IDENTIFICATION;
   hsai_BlockA1.FrameInit.FSPolarity = SAI_FS_ACTIVE_LOW;
   hsai_BlockA1.FrameInit.FSOffset = SAI_FS_FIRSTBIT;
   hsai_BlockA1.SlotInit.FirstBitOffset = 0;
   hsai_BlockA1.SlotInit.SlotSize = SAI_SLOTSIZE_32B;
-  hsai_BlockA1.SlotInit.SlotNumber = 2;
-  hsai_BlockA1.SlotInit.SlotActive = 0x00000003;
+  hsai_BlockA1.SlotInit.SlotNumber = 8;                // TDM8: 8 slots (was 2)
+  hsai_BlockA1.SlotInit.SlotActive = 0x000000FF;       // All 8 slots active (was 0x03)
   if (HAL_SAI_Init(&hsai_BlockA1) != HAL_OK)
   {
     Error_Handler();
   }
   /* USER CODE BEGIN SAI1_Init 2 */
+
+  /* SAI1_B: Slave TX synchronized with SAI1_A (channels 8-15) */
+  hsai_BlockB1.Instance = SAI1_Block_B;
+  hsai_BlockB1.Init.Protocol = SAI_FREE_PROTOCOL;
+  hsai_BlockB1.Init.AudioMode = SAI_MODESLAVE_TX;
+  hsai_BlockB1.Init.DataSize = SAI_DATASIZE_24;
+  hsai_BlockB1.Init.FirstBit = SAI_FIRSTBIT_MSB;
+  hsai_BlockB1.Init.ClockStrobing = SAI_CLOCKSTROBING_FALLINGEDGE;
+  hsai_BlockB1.Init.Synchro = SAI_SYNCHRONOUS;
+  hsai_BlockB1.Init.OutputDrive = SAI_OUTPUTDRIVE_DISABLE;
+  hsai_BlockB1.Init.FIFOThreshold = SAI_FIFOTHRESHOLD_EMPTY;
+  hsai_BlockB1.Init.SynchroExt = SAI_SYNCEXT_DISABLE;
+  hsai_BlockB1.Init.MonoStereoMode = SAI_STEREOMODE;
+  hsai_BlockB1.Init.CompandingMode = SAI_NOCOMPANDING;
+  hsai_BlockB1.Init.TriState = SAI_OUTPUT_NOTRELEASED;
+  hsai_BlockB1.Init.PdmInit.Activation = DISABLE;
+  hsai_BlockB1.Init.PdmInit.MicPairsNbr = 1;
+  hsai_BlockB1.Init.PdmInit.ClockEnable = SAI_PDM_CLOCK1_ENABLE;
+  hsai_BlockB1.FrameInit.FrameLength = 256;
+  hsai_BlockB1.FrameInit.ActiveFrameLength = 32;
+  hsai_BlockB1.FrameInit.FSDefinition = SAI_FS_CHANNEL_IDENTIFICATION;
+  hsai_BlockB1.FrameInit.FSPolarity = SAI_FS_ACTIVE_LOW;
+  hsai_BlockB1.FrameInit.FSOffset = SAI_FS_FIRSTBIT;
+  hsai_BlockB1.SlotInit.FirstBitOffset = 0;
+  hsai_BlockB1.SlotInit.SlotSize = SAI_SLOTSIZE_32B;
+  hsai_BlockB1.SlotInit.SlotNumber = 8;
+  hsai_BlockB1.SlotInit.SlotActive = 0x000000FF;
+  if (HAL_SAI_Init(&hsai_BlockB1) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
   /* USER CODE END SAI1_Init 2 */
 
@@ -496,6 +965,157 @@ static void MX_UART7_Init(void)
 }
 
 /**
+  * @brief UART4 Initialization Function (ESP32 communication)
+  * @note  PA0=TX, PA1=RX, 115200 8N1
+  */
+static void MX_UART4_Init(void)
+{
+  huart4.Instance = UART4;
+  huart4.Init.BaudRate = 115200;
+  huart4.Init.WordLength = UART_WORDLENGTH_8B;
+  huart4.Init.StopBits = UART_STOPBITS_1;
+  huart4.Init.Parity = UART_PARITY_NONE;
+  huart4.Init.Mode = UART_MODE_TX_RX;
+  huart4.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart4.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart4.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart4.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart4.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart4, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart4, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief SAI2 Initialization Function (DAC2 + DAC3)
+  * @note  SAI2_A: Master TX TDM8, PD13(FS)/PD12(SCK)/PD11(SD)
+  *        SAI2_B: Slave TX synced to SAI2_A, PD8(SD only)
+  *        Both use PLL3 (same as SAI1) for identical sample rate
+  */
+static void MX_SAI2_Init(void)
+{
+  /* SAI2_A: Master TX - identical TDM8 config as SAI1_A */
+  hsai_BlockA2.Instance = SAI2_Block_A;
+  hsai_BlockA2.Init.Protocol = SAI_FREE_PROTOCOL;
+  hsai_BlockA2.Init.AudioMode = SAI_MODEMASTER_TX;
+  hsai_BlockA2.Init.DataSize = SAI_DATASIZE_24;
+  hsai_BlockA2.Init.FirstBit = SAI_FIRSTBIT_MSB;
+  hsai_BlockA2.Init.ClockStrobing = SAI_CLOCKSTROBING_FALLINGEDGE;
+  hsai_BlockA2.Init.Synchro = SAI_ASYNCHRONOUS;
+  hsai_BlockA2.Init.OutputDrive = SAI_OUTPUTDRIVE_DISABLE;
+  hsai_BlockA2.Init.NoDivider = SAI_MCK_OVERSAMPLING_DISABLE;
+  hsai_BlockA2.Init.MckOverSampling = SAI_MCK_OVERSAMPLING_DISABLE;
+  hsai_BlockA2.Init.FIFOThreshold = SAI_FIFOTHRESHOLD_EMPTY;
+  hsai_BlockA2.Init.AudioFrequency = SAI_AUDIO_FREQUENCY_48K;
+  hsai_BlockA2.Init.SynchroExt = SAI_SYNCEXT_DISABLE;
+  hsai_BlockA2.Init.MonoStereoMode = SAI_STEREOMODE;
+  hsai_BlockA2.Init.CompandingMode = SAI_NOCOMPANDING;
+  hsai_BlockA2.Init.TriState = SAI_OUTPUT_NOTRELEASED;
+  hsai_BlockA2.Init.PdmInit.Activation = DISABLE;
+  hsai_BlockA2.Init.PdmInit.MicPairsNbr = 1;
+  hsai_BlockA2.Init.PdmInit.ClockEnable = SAI_PDM_CLOCK1_ENABLE;
+  hsai_BlockA2.FrameInit.FrameLength = 256;
+  hsai_BlockA2.FrameInit.ActiveFrameLength = 32;
+  hsai_BlockA2.FrameInit.FSDefinition = SAI_FS_CHANNEL_IDENTIFICATION;
+  hsai_BlockA2.FrameInit.FSPolarity = SAI_FS_ACTIVE_LOW;
+  hsai_BlockA2.FrameInit.FSOffset = SAI_FS_FIRSTBIT;
+  hsai_BlockA2.SlotInit.FirstBitOffset = 0;
+  hsai_BlockA2.SlotInit.SlotSize = SAI_SLOTSIZE_32B;
+  hsai_BlockA2.SlotInit.SlotNumber = 8;
+  hsai_BlockA2.SlotInit.SlotActive = 0x000000FF;
+  if (HAL_SAI_Init(&hsai_BlockA2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* SAI2_B: Slave TX - synchronized with SAI2_A (shares SCK/FS internally) */
+  hsai_BlockB2.Instance = SAI2_Block_B;
+  hsai_BlockB2.Init.Protocol = SAI_FREE_PROTOCOL;
+  hsai_BlockB2.Init.AudioMode = SAI_MODESLAVE_TX;
+  hsai_BlockB2.Init.DataSize = SAI_DATASIZE_24;
+  hsai_BlockB2.Init.FirstBit = SAI_FIRSTBIT_MSB;
+  hsai_BlockB2.Init.ClockStrobing = SAI_CLOCKSTROBING_FALLINGEDGE;
+  hsai_BlockB2.Init.Synchro = SAI_SYNCHRONOUS;
+  hsai_BlockB2.Init.OutputDrive = SAI_OUTPUTDRIVE_DISABLE;
+  hsai_BlockB2.Init.FIFOThreshold = SAI_FIFOTHRESHOLD_EMPTY;
+  hsai_BlockB2.Init.SynchroExt = SAI_SYNCEXT_DISABLE;
+  hsai_BlockB2.Init.MonoStereoMode = SAI_STEREOMODE;
+  hsai_BlockB2.Init.CompandingMode = SAI_NOCOMPANDING;
+  hsai_BlockB2.Init.TriState = SAI_OUTPUT_NOTRELEASED;
+  hsai_BlockB2.Init.PdmInit.Activation = DISABLE;
+  hsai_BlockB2.Init.PdmInit.MicPairsNbr = 1;
+  hsai_BlockB2.Init.PdmInit.ClockEnable = SAI_PDM_CLOCK1_ENABLE;
+  hsai_BlockB2.FrameInit.FrameLength = 256;
+  hsai_BlockB2.FrameInit.ActiveFrameLength = 32;
+  hsai_BlockB2.FrameInit.FSDefinition = SAI_FS_CHANNEL_IDENTIFICATION;
+  hsai_BlockB2.FrameInit.FSPolarity = SAI_FS_ACTIVE_LOW;
+  hsai_BlockB2.FrameInit.FSOffset = SAI_FS_FIRSTBIT;
+  hsai_BlockB2.SlotInit.FirstBitOffset = 0;
+  hsai_BlockB2.SlotInit.SlotSize = SAI_SLOTSIZE_32B;
+  hsai_BlockB2.SlotInit.SlotNumber = 8;
+  hsai_BlockB2.SlotInit.SlotActive = 0x000000FF;
+  if (HAL_SAI_Init(&hsai_BlockB2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief SAI3 Initialization Function (ADC input)
+  * @note  SAI3_B: Master RX, I2S stereo (2 channels), PD8(SCK)/PD9(SD)/PD10(FS)
+  *        Uses PLL3 via Sai23ClockSelection (shared with SAI2)
+  */
+static void MX_SAI3_Init(void)
+{
+  /* SAI3_B: Master RX - ADC input (2 channels) */
+  hsai_BlockB3.Instance = SAI3_Block_B;
+  hsai_BlockB3.Init.Protocol = SAI_FREE_PROTOCOL;
+  hsai_BlockB3.Init.AudioMode = SAI_MODEMASTER_RX;
+  hsai_BlockB3.Init.DataSize = SAI_DATASIZE_24;
+  hsai_BlockB3.Init.FirstBit = SAI_FIRSTBIT_MSB;
+  hsai_BlockB3.Init.ClockStrobing = SAI_CLOCKSTROBING_FALLINGEDGE;
+  hsai_BlockB3.Init.Synchro = SAI_ASYNCHRONOUS;
+  hsai_BlockB3.Init.OutputDrive = SAI_OUTPUTDRIVE_DISABLE;
+  hsai_BlockB3.Init.NoDivider = SAI_MCK_OVERSAMPLING_DISABLE;
+  hsai_BlockB3.Init.MckOverSampling = SAI_MCK_OVERSAMPLING_DISABLE;
+  hsai_BlockB3.Init.FIFOThreshold = SAI_FIFOTHRESHOLD_EMPTY;
+  hsai_BlockB3.Init.AudioFrequency = SAI_AUDIO_FREQUENCY_48K;
+  hsai_BlockB3.Init.SynchroExt = SAI_SYNCEXT_DISABLE;
+  hsai_BlockB3.Init.MonoStereoMode = SAI_STEREOMODE;
+  hsai_BlockB3.Init.CompandingMode = SAI_NOCOMPANDING;
+  hsai_BlockB3.Init.TriState = SAI_OUTPUT_NOTRELEASED;
+  hsai_BlockB3.Init.PdmInit.Activation = DISABLE;
+  hsai_BlockB3.Init.PdmInit.MicPairsNbr = 1;
+  hsai_BlockB3.Init.PdmInit.ClockEnable = SAI_PDM_CLOCK1_ENABLE;
+  hsai_BlockB3.FrameInit.FrameLength = 64;              // 2 slots x 32 bits
+  hsai_BlockB3.FrameInit.ActiveFrameLength = 32;
+  hsai_BlockB3.FrameInit.FSDefinition = SAI_FS_CHANNEL_IDENTIFICATION;
+  hsai_BlockB3.FrameInit.FSPolarity = SAI_FS_ACTIVE_LOW;
+  hsai_BlockB3.FrameInit.FSOffset = SAI_FS_FIRSTBIT;
+  hsai_BlockB3.SlotInit.FirstBitOffset = 0;
+  hsai_BlockB3.SlotInit.SlotSize = SAI_SLOTSIZE_32B;
+  hsai_BlockB3.SlotInit.SlotNumber = 2;
+  hsai_BlockB3.SlotInit.SlotActive = 0x00000003;
+  if (HAL_SAI_Init(&hsai_BlockB3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
   * Enable DMA controller clock
   */
 static void MX_DMA_Init(void)
@@ -505,9 +1125,21 @@ static void MX_DMA_Init(void)
   __HAL_RCC_DMA1_CLK_ENABLE();
 
   /* DMA interrupt init */
-  /* DMA1_Stream0_IRQn interrupt configuration */
+  /* DMA1_Stream0_IRQn interrupt configuration (SAI1_A) */
   HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
+  /* DMA1_Stream1_IRQn interrupt configuration (SAI2_A) */
+  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
+  /* DMA1_Stream2_IRQn interrupt configuration (SAI2_B) */
+  HAL_NVIC_SetPriority(DMA1_Stream2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream2_IRQn);
+  /* DMA1_Stream3_IRQn interrupt configuration (SAI1_B) */
+  HAL_NVIC_SetPriority(DMA1_Stream3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream3_IRQn);
+  /* DMA1_Stream4_IRQn interrupt configuration (SAI3_B RX) */
+  HAL_NVIC_SetPriority(DMA1_Stream4_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream4_IRQn);
   /* DMAMUX1_OVR_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMAMUX1_OVR_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMAMUX1_OVR_IRQn);
@@ -594,7 +1226,160 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
+/**
+  * @brief SPI2 Initialization Function
+  * @note  Used for E-Paper display (PB13=SCK, PB15=MOSI)
+  * @param None
+  * @retval None
+  */
+static void MX_SPI2_Init(void)
+{
+  /* Enable SPI2 clock */
+  __HAL_RCC_SPI2_CLK_ENABLE();
+
+  /* Configure SPI2 GPIO pins FIRST: PB13=SCK, PB15=MOSI */
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  GPIO_InitStruct.Pin = GPIO_PIN_13 | GPIO_PIN_15;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* Configure SPI2 - TX only (e-paper has no MISO) */
+  hspi2.Instance = SPI2;
+  hspi2.Init.Mode = SPI_MODE_MASTER;
+  hspi2.Init.Direction = SPI_DIRECTION_2LINES_TXONLY;
+  hspi2.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi2.Init.NSS = SPI_NSS_SOFT;
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
+  hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi2.Init.CRCPolynomial = 7;
+  hspi2.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+  hspi2.Init.NSSPolarity = SPI_NSS_POLARITY_LOW;
+  hspi2.Init.FifoThreshold = SPI_FIFO_THRESHOLD_01DATA;
+  hspi2.Init.TxCRCInitializationPattern = SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
+  hspi2.Init.RxCRCInitializationPattern = SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
+  hspi2.Init.MasterSSIdleness = SPI_MASTER_SS_IDLENESS_00CYCLE;
+  hspi2.Init.MasterInterDataIdleness = SPI_MASTER_INTERDATA_IDLENESS_00CYCLE;
+  hspi2.Init.MasterReceiverAutoSusp = SPI_MASTER_RX_AUTOSUSP_DISABLE;
+  hspi2.Init.MasterKeepIOState = SPI_MASTER_KEEP_IO_STATE_DISABLE;
+  hspi2.Init.IOSwap = SPI_IO_SWAP_DISABLE;
+
+  if (HAL_SPI_Init(&hspi2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
 /* USER CODE BEGIN 4 */
+
+/**
+ * @brief Initialize E-Paper control GPIO pins
+ * PB12=CS, PD4=DC, PD5=RST, PD6=BUSY
+ * (PD8/PD9/PD10 freed for SAI2_B)
+ */
+static void EPD_GPIO_Init(void) {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  /* CS pin - PB12 */
+  GPIO_InitStruct.Pin = EPD_CS_PIN;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(EPD_CS_PORT, &GPIO_InitStruct);
+  HAL_GPIO_WritePin(EPD_CS_PORT, EPD_CS_PIN, GPIO_PIN_SET);  /* CS high (inactive) */
+
+  /* DC pin - PD4 */
+  GPIO_InitStruct.Pin = EPD_DC_PIN;
+  HAL_GPIO_Init(EPD_DC_PORT, &GPIO_InitStruct);
+
+  /* RST pin - PD5 */
+  GPIO_InitStruct.Pin = EPD_RST_PIN;
+  HAL_GPIO_Init(EPD_RST_PORT, &GPIO_InitStruct);
+  HAL_GPIO_WritePin(EPD_RST_PORT, EPD_RST_PIN, GPIO_PIN_SET);  /* RST high (not reset) */
+
+  /* BUSY pin - PD6 (input with pull-down: LOW when no e-paper connected) */
+  GPIO_InitStruct.Pin = EPD_BUSY_PIN;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(EPD_BUSY_PORT, &GPIO_InitStruct);
+}
+
+/**
+ * @brief Display test results on E-Paper screen
+ */
+static void EPD_ShowTestResults(uint32_t half_cnt, uint32_t full_cnt, uint32_t err_cnt,
+                                uint32_t time_s, uint8_t passed, uint32_t underruns) {
+  char line[32];
+
+  /* Clear buffer to white */
+  EPD_FillBuffer(epd_buffer, EPD_WHITE);
+
+  /* Draw border */
+  EPD_DrawRect(epd_buffer, 5, 5, 190, 190, EPD_BLACK);
+  EPD_DrawRect(epd_buffer, 6, 6, 188, 188, EPD_BLACK);
+
+  /* Title */
+  EPD_DrawString(epd_buffer, 20, 12, "DMA AUDIO TEST", 16, EPD_BLACK);
+
+  /* Horizontal line under title */
+  EPD_DrawLine(epd_buffer, 10, 32, 190, 32, EPD_BLACK);
+
+  /* Half callbacks */
+  EPD_DrawString(epd_buffer, 15, 42, "Half:", 8, EPD_BLACK);
+  sprintf(line, "%lu", half_cnt);
+  EPD_DrawString(epd_buffer, 85, 42, line, 8, EPD_BLACK);
+
+  /* Full callbacks */
+  EPD_DrawString(epd_buffer, 15, 55, "Full:", 8, EPD_BLACK);
+  sprintf(line, "%lu", full_cnt);
+  EPD_DrawString(epd_buffer, 85, 55, line, 8, EPD_BLACK);
+
+  /* Errors */
+  EPD_DrawString(epd_buffer, 15, 68, "Errors:", 8, EPD_BLACK);
+  sprintf(line, "%lu", err_cnt);
+  EPD_DrawString(epd_buffer, 85, 68, line, 8, EPD_BLACK);
+
+  /* Underruns */
+  EPD_DrawString(epd_buffer, 15, 81, "Underrun:", 8, EPD_BLACK);
+  sprintf(line, "%lu", underruns);
+  EPD_DrawString(epd_buffer, 85, 81, line, 8, EPD_BLACK);
+
+  /* Rate calculation (integer - nano.specs has no %f) */
+  EPD_DrawString(epd_buffer, 15, 94, "Rate:", 8, EPD_BLACK);
+  sprintf(line, "%lu/s", half_cnt / 60);
+  EPD_DrawString(epd_buffer, 85, 94, line, 8, EPD_BLACK);
+
+  /* Pipeline info */
+  EPD_DrawString(epd_buffer, 15, 107, "Pipeline:", 8, EPD_BLACK);
+  EPD_DrawString(epd_buffer, 85, 107, "Deferred+Cache", 8, EPD_BLACK);
+
+  /* Horizontal line */
+  EPD_DrawLine(epd_buffer, 10, 122, 190, 122, EPD_BLACK);
+
+  /* Result */
+  if (passed) {
+    EPD_DrawString(epd_buffer, 30, 132, ">>> PASSED <<<", 8, EPD_BLACK);
+  } else {
+    EPD_DrawString(epd_buffer, 30, 132, ">>> FAILED <<<", 8, EPD_BLACK);
+  }
+
+  /* Total time */
+  sprintf(line, "Time: %lu s", time_s);
+  EPD_DrawString(epd_buffer, 55, 150, line, 8, EPD_BLACK);
+
+  /* Test cycle indicator */
+  sprintf(line, "Cycle #%lu", test_cycle);
+  EPD_DrawString(epd_buffer, 60, 168, line, 8, EPD_BLACK);
+
+  /* Send to display */
+  EPD_Display(epd_buffer);
+}
 
 /**
  * @brief Print string via UART (blocking)
@@ -715,52 +1500,184 @@ static void Print_DMA_Config(void) {
 }
 
 /**
- * @brief Fill audio buffer with 1kHz sine wave
- * @param buffer Pointer to buffer (stereo interleaved)
- * @param samples Number of stereo samples to generate
+ * @brief Process ADC half-buffer: deinterleave stereo into delay lines
+ * @param rx_buf  Pointer to received interleaved L,R,L,R... samples
+ * @param samples Number of mono samples (half of ADC_BUFFER_SAMPLES = 240)
+ *
+ * Feeds the circular delay lines from ADC input.
+ * Must be called BEFORE Fill_Audio_Beamform in the same processing cycle.
  */
-static void Fill_Audio_Buffer(int32_t *buffer, uint32_t samples) {
-  const float phase_inc = (2.0f * M_PI * TEST_TONE_FREQ) / AUDIO_SAMPLE_RATE;
+static void Process_ADC_Half(int32_t *rx_buf, uint32_t samples) {
+  uint32_t wp = delay_write_pos;
+  for (uint32_t i = 0; i < samples; i++) {
+    delay_line_L[(wp + i) & DELAY_LINE_MASK] = rx_buf[i * ADC_CHANNELS];
+    delay_line_R[(wp + i) & DELAY_LINE_MASK] = rx_buf[i * ADC_CHANNELS + 1];
+  }
+  delay_write_pos = (wp + samples) & DELAY_LINE_MASK;
+}
+
+/**
+ * @brief Fill TX buffer with beamformed audio from delay line
+ * @param buffer    Pointer to TDM8 output buffer (8ch interleaved)
+ * @param samples   Number of sample frames to fill (240 per half-buffer)
+ * @param ch_offset Global channel offset (0, 8, 16, or 24)
+ *
+ * For each of the 8 channels in this SAI block, reads the delay line at the
+ * per-channel delay offset, applies gain and mute. Single beam (L only) for now.
+ */
+static void Fill_Audio_Beamform(int32_t *buffer, uint32_t samples, uint32_t ch_offset) {
+  uint32_t wp = delay_write_pos;
+  uint8_t master = beam_config.mute_global ? 0 : beam_config.master_gain;
 
   for (uint32_t i = 0; i < samples; i++) {
-    // Generate 24-bit sample (left-aligned in 32-bit word)
-    // Max value for 24-bit = 0x7FFFFF
-    int32_t sample = (int32_t)(sinf(sine_phase) * 0x7FFFFF);
+    for (uint32_t ch = 0; ch < AUDIO_CHANNELS; ch++) {
+      uint32_t gch = ch_offset + ch;
+      uint16_t delay = beam_config.delays[gch];
+      if (delay > MAX_DELAY_SAMPLES) delay = MAX_DELAY_SAMPLES;
 
-    // Stereo: same signal on both channels
-    buffer[i * 2]     = sample;  // Left
-    buffer[i * 2 + 1] = sample;  // Right
+      // Read from delay line: wp points to next write position,
+      // so the most recent sample is at wp-1. We want sample that is
+      // 'delay' samples old, offset by buffer position.
+      uint32_t read_pos = (wp - delay - samples + i) & DELAY_LINE_MASK;
+      int32_t sample = delay_line_L[read_pos];
 
-    // Advance phase
-    sine_phase += phase_inc;
-    if (sine_phase >= 2.0f * M_PI) {
-      sine_phase -= 2.0f * M_PI;
+      // Apply per-channel gain (fixed-point: * gain >> 8)
+      uint8_t gain = beam_config.gains[gch];
+      sample = (sample * gain) >> 8;
+
+      // Apply master gain
+      sample = (sample * master) >> 8;
+
+      // Apply per-channel mute
+      if (beam_config.mutes & (1UL << gch)) {
+        sample = 0;
+      }
+
+      buffer[i * AUDIO_CHANNELS + ch] = sample;
     }
   }
 }
 
 /**
- * @brief SAI TX Half Complete callback (first half of buffer sent)
+ * @brief SAI TX Half Complete callback - MINIMAL ISR
+ * DMA finished sending first half → CPU can now safely fill it
  * Called every 10ms (half of 20ms buffer cycle)
+ *
+ * IMPORTANT: No heavy processing here! Just set flag for main loop.
+ * ISR budget: ~20 cycles (vs ~50000 if sinf() was called here)
  */
 void HAL_SAI_TxHalfCpltCallback(SAI_HandleTypeDef *hsai) {
   if (hsai->Instance == SAI1_Block_A) {
+    uint32_t now = DWT->CYCCNT;
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);  // PB5 HIGH (scope trigger)
+
     half_complete_count++;
-    // Toggle LED at 50Hz for visual DMA sync (appears as dimmed LED)
-    HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_3);
-    // Refill first half of buffer
-    Fill_Audio_Buffer(&audio_buffer[0], AUDIO_BUFFER_SAMPLES);
+
+    // Jitter: measure period between consecutive Half callbacks
+    if (last_half_isr_cycles != 0) {
+      uint32_t period = now - last_half_isr_cycles;
+      // Sanity guard: expected ~9.6M cycles (20ms@480MHz). Reject > 15M (31ms) as stale/reset artifact
+      if (period < 15000000) {
+        if (period < jitter_min_cycles) jitter_min_cycles = period;
+        if (period > jitter_max_cycles) jitter_max_cycles = period;
+        jitter_sum_cycles += period;
+        jitter_sample_count++;
+      }
+    }
+    last_half_isr_cycles = now;
+
+    // Underrun detection: previous request not yet serviced
+    if (need_fill_first_half) {
+      underrun_count++;
+    }
+
+    need_fill_first_half = 1;
+    __DSB();
+  }
+  else if (hsai->Instance == SAI1_Block_B) {
+    if (need_fill_1b_first_half) underrun_count++;
+    need_fill_1b_first_half = 1;
+    __DSB();
+  }
+  else if (hsai->Instance == SAI2_Block_A) {
+    if (need_fill_2a_first_half) underrun_count++;
+    need_fill_2a_first_half = 1;
+    __DSB();
+  }
+  else if (hsai->Instance == SAI2_Block_B) {
+    if (need_fill_2b_first_half) underrun_count++;
+    need_fill_2b_first_half = 1;
+    __DSB();
   }
 }
 
 /**
- * @brief SAI TX Complete callback (second half of buffer sent)
+ * @brief SAI TX Full Complete callback - MINIMAL ISR
+ * DMA finished sending second half → CPU can now safely fill it
  */
 void HAL_SAI_TxCpltCallback(SAI_HandleTypeDef *hsai) {
   if (hsai->Instance == SAI1_Block_A) {
+    uint32_t now = DWT->CYCCNT;
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);  // PB5 HIGH (scope trigger)
+
     full_complete_count++;
-    // Refill second half of buffer
-    Fill_Audio_Buffer(&audio_buffer[AUDIO_BUFFER_SIZE], AUDIO_BUFFER_SAMPLES);
+
+    // Jitter: measure period between consecutive Full callbacks
+    if (last_full_isr_cycles != 0) {
+      uint32_t period = now - last_full_isr_cycles;
+      // Sanity guard: expected ~9.6M cycles (20ms@480MHz). Reject > 15M (31ms) as stale/reset artifact
+      if (period < 15000000) {
+        if (period < jitter_min_cycles) jitter_min_cycles = period;
+        if (period > jitter_max_cycles) jitter_max_cycles = period;
+        jitter_sum_cycles += period;
+        jitter_sample_count++;
+      }
+    }
+    last_full_isr_cycles = now;
+
+    if (need_fill_second_half) {
+      underrun_count++;
+    }
+
+    need_fill_second_half = 1;
+    __DSB();
+  }
+  else if (hsai->Instance == SAI1_Block_B) {
+    if (need_fill_1b_second_half) underrun_count++;
+    need_fill_1b_second_half = 1;
+    __DSB();
+  }
+  else if (hsai->Instance == SAI2_Block_A) {
+    if (need_fill_2a_second_half) underrun_count++;
+    need_fill_2a_second_half = 1;
+    __DSB();
+  }
+  else if (hsai->Instance == SAI2_Block_B) {
+    if (need_fill_2b_second_half) underrun_count++;
+    need_fill_2b_second_half = 1;
+    __DSB();
+  }
+}
+
+/**
+ * @brief SAI RX Half Complete callback
+ * DMA filled first half of RX buffer → CPU can process it
+ */
+void HAL_SAI_RxHalfCpltCallback(SAI_HandleTypeDef *hsai) {
+  if (hsai->Instance == SAI3_Block_B) {
+    rx_3b_first_half_ready = 1;
+    __DSB();
+  }
+}
+
+/**
+ * @brief SAI RX Full Complete callback
+ * DMA filled second half of RX buffer → CPU can process it
+ */
+void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef *hsai) {
+  if (hsai->Instance == SAI3_Block_B) {
+    rx_3b_second_half_ready = 1;
+    __DSB();
   }
 }
 

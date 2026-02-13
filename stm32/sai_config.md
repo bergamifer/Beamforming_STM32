@@ -1,5 +1,10 @@
 # STM32H743 SAI Configuration - TDM Mode
 
+> **Nota (2026-02-13):** La seccion SAI4_B fue diseñada para DS9 — en DS10, el ADC usa
+> **SAI3_B** (PD8/PD9/PD10 AF6) ya que SAI4_B SCK/FS no estan en LQFP100.
+> SAI1_B usa sync mode (PE3 SD only). SAI2_B usa sync mode (PE11 SD only).
+> Ver `docs/audio_architecture.md` para el mapeo DS10 correcto.
+
 ## Configuración para DACs (TDM 8 canales por DAC)
 
 ### SAI1_A - DAC0 (8 canales)

@@ -37,6 +37,9 @@ make clean && make -j4
 minicom -D /dev/tty.usbmodem102 -b 115200
 minicom -D /dev/tty.usbmodem1102 -b 115200
 
+# Buscar puertos serie
+ls /dev/tty.usb*     
+
 # Para salir de minicom: Ctrl+A luego X
 ```
 
@@ -90,7 +93,11 @@ cd webserver
 
 | Archivo | Descripcion |
 |---------|-------------|
-| `firmware/Core/Src/main.c` | Codigo principal |
-| `firmware/Weact_test_audio.ioc` | Config CubeMX |
-| `firmware/STM32H743XX_FLASH.ld` | Linker script (incluye .dma_buffer) |
+| `firmware/Core/Src/main.c` | Init, clocks 480MHz, DMA, callbacks, main loop |
+| `firmware/Core/Src/uart_protocol.c` | Parser binario ESP32→STM32 |
+| `firmware/Core/Inc/uart_protocol.h` | Protocol defines, ds_config_t |
+| `firmware/Core/Src/pcm1690.c` | Driver PCM1690 DAC |
+| `firmware/Core/Src/epaper.c` | Driver SSD1681 e-paper |
+| `firmware/STM32H743XX_FLASH.ld` | Linker script (.dma_buffer -> RAM_D2) |
 | `firmware/Makefile` | Build config |
+| `uart-stm32-protocol.md` | Especificacion protocolo binario |
